@@ -2,6 +2,7 @@ import argparse
 import os
 import pickle
 import shutil
+import yaml
 from importlib import metadata
 
 try:
@@ -21,35 +22,27 @@ from g1_env import G1Env
 
 
 def get_train_cfg(exp_name, max_iterations):
+    """Load training configuration from YAML file"""
+    config_path = os.path.join(os.path.dirname(__file__), "configs", "g1_config.yaml")
+    
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    training_cfg = config["training"]
+    
+    # Build train_cfg_dict from YAML
     train_cfg_dict = {
-        "algorithm": {
-            "class_name": "PPO",
-            "clip_param": 0.2,
-            "desired_kl": 0.01,
-            "entropy_coef": 0.01,
-            "gamma": 0.99,
-            "lam": 0.95,
-            "learning_rate": 0.001,
-            "max_grad_norm": 1.0,
-            "num_learning_epochs": 5,
-            "num_mini_batches": 4,
-            "schedule": "adaptive",
-            "use_clipped_value_loss": True,
-            "value_loss_coef": 1.0,
-        },
+        "algorithm": training_cfg["algorithm"],
         "init_member_classes": {},
-        "policy": {
-            "activation": "elu",
-            "actor_hidden_dims": [512, 256, 128],
-            "critic_hidden_dims": [512, 256, 128],
-            "init_noise_std": 1.0,
-            "class_name": "ActorCritic",
-        },
+        "policy": training_cfg["policy"],
         "runner": {
             "checkpoint": -1,
             "experiment_name": exp_name,
             "load_run": -1,
-            "log_interval": 1,
+            "log_interval": training_cfg["runner"]["log_interval"],
             "max_iterations": max_iterations,
             "record_interval": -1,
             "resume": False,
@@ -57,134 +50,37 @@ def get_train_cfg(exp_name, max_iterations):
             "run_name": "",
         },
         "runner_class_name": "OnPolicyRunner",
-        "num_steps_per_env": 24,
-        "save_interval": 100,
+        "num_steps_per_env": training_cfg["runner"]["num_steps_per_env"],
+        "save_interval": training_cfg["runner"]["save_interval"],
         "empirical_normalization": None,
-        "seed": 1,
+        "seed": training_cfg["runner"]["seed"],
     }
 
     return train_cfg_dict
 
 # Configs from https://github.com/unitreerobotics/unitree_rl_gym/blob/main/legged_gym/envs/g1/g1_config.py
 def get_cfgs():
-    # G1 humanoid has 12 DOF (6 per leg)
-    # left_hip_pitch, left_hip_roll, left_hip_yaw, left_knee, left_ankle_pitch, left_ankle_roll
-    # right_hip_pitch, right_hip_roll, right_hip_yaw, right_knee, right_ankle_pitch, right_ankle_roll
-    env_cfg = {
-        "num_actions": 12,
-        # joint/link names - G1 12DOF configuration
-        "default_joint_angles": {  # [rad]
-            "left_hip_pitch_joint": -0.1,
-            "left_hip_roll_joint": 0.0,
-            "left_hip_yaw_joint": 0.0,
-            "left_knee_joint": 0.3,
-            "left_ankle_pitch_joint": -0.2,
-            "left_ankle_roll_joint": 0.0,
-            "right_hip_pitch_joint": -0.1,
-            "right_hip_roll_joint": 0.0,
-            "right_hip_yaw_joint": 0.0,
-            "right_knee_joint": 0.3,
-            "right_ankle_pitch_joint": -0.2,
-            "right_ankle_roll_joint": 0.0,
-        },
-        "joint_names": [
-            "left_hip_pitch_joint",
-            "left_hip_roll_joint",
-            "left_hip_yaw_joint",
-            "left_knee_joint",
-            "left_ankle_pitch_joint",
-            "left_ankle_roll_joint",
-            "right_hip_pitch_joint",
-            "right_hip_roll_joint",
-            "right_hip_yaw_joint",
-            "right_knee_joint",
-            "right_ankle_pitch_joint",
-            "right_ankle_roll_joint",
-        ],
-        # PD gains - humanoids typically need higher gains for stability
-        "stiffness": {
-            "hip_yaw": 100,
-            "hip_roll": 100,
-            "hip_pitch": 100,
-            "knee": 150,
-            "ankle": 40,
-        },  # [N*m/rad]
-        "damping": {
-            "hip_yaw": 2,
-            "hip_roll": 2,
-            "hip_pitch": 2,
-            "knee": 4,
-            "ankle": 2,
-        },  # [N*m*s/rad]
-        # termination - humanoids are less stable than quadrupeds
-        "termination_if_roll_greater_than": 20,  # degree
-        "termination_if_pitch_greater_than": 20,  # degree
-        "termination_if_base_height_less_than": 0.5,  # meter
-        # base pose - humanoid standing height
-        "base_init_pos": [0.0, 0.0, 0.80],
-        "base_init_quat": [1.0, 0.0, 0.0, 0.0],
-        "episode_length_s": 20.0,
-        "resampling_time_s": 4.0,
-        "action_scale": 0.25,
-        "simulate_action_latency": True,
-        "clip_actions": 100.0,
-    }
-    obs_cfg = {
-        "num_obs": 47,  # Updated: added 2 for sin/cos phase
-        "obs_scales": {
-            "lin_vel": 2.0,
-            "ang_vel": 0.25,
-            "dof_pos": 1.0,
-            "dof_vel": 0.05,
-        },
-    }
-    reward_cfg = {
-        "tracking_sigma": 0.25,
-        "base_height_target": 0.78,
-        "close_feet_xy_threshold": 0.15,  # meters
-        "swing_height": 0.06,  # Maximum foot height during swing phase [m]
-        "reward_scales": {
-            "tracking_lin_vel": 2.0,
-            "tracking_ang_vel": 1.5,
-            "penalty_ang_vel_xy": -1.0,
-            "orientation": -5.0,
-            "lin_vel_z": -1.0,
-            "base_height": 0.0,
-            "action_rate": -0.01,
-            "feet_phase": 0.0,
-            "close_feet_xy": -10.0,
-            "penalty_feet_orientation": -5.0,
-            "torques": -0.0001,
-            "dof_acc": -2.5e-7,
-        },
-    }
-    command_cfg = {
-        "num_commands": 3,
-        "lin_vel_x_range": [0.8, 0.8],  # Start with slow forward walking
-        "lin_vel_y_range": [0.0, 0.0],
-        "ang_vel_range": [0.0, 0.0],
-    }
+    """Load configuration from YAML file"""
+    # Load YAML config
+    config_path = os.path.join(os.path.dirname(__file__), "configs", "g1_config.yaml")
     
-    randomization_cfg = {
-        "add_noise": False,
-        "noise_scales": {
-            "dof_pos": 0.01,    # +/- 0.01 rad
-            "dof_vel": 0.1,     # +/- 0.1 rad/s
-            "ang_vel": 0.2,     # +/- 0.2 rad/s
-            "gravity": 0.05,    # +/- 0.05
-            "commands": 0.0,    # No noise on commands
-        },
-        "randomize_friction": False,
-        "friction_range": [0.5, 1.25],
-        "randomize_base_mass": False,
-        "added_mass_range": [-1.0, 3.0],  # +/- kg
-        "randomize_motor_strength": False,
-        "motor_strength_range": [0.8, 1.2],  # +/- 20%
-        "push_robots": False,
-        "push_interval_s": 15,
-        "max_push_vel_xy": 1.0,  # m/s
-    }
-
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Extract config sections
+    env_cfg = config["env"]
+    obs_cfg = config["observation"]
+    
+    # Extract reward config
+    reward_cfg = config["rewards"]["parameters"]
+    reward_cfg["reward_scales"] = config["rewards"]["scales"]
+    
+    command_cfg = config["commands"]
+    randomization_cfg = config["randomization"]
+    
     return env_cfg, obs_cfg, reward_cfg, command_cfg, randomization_cfg
 
 
@@ -192,7 +88,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="g1-walking")
     parser.add_argument("-B", "--num_envs", type=int, default=4096)
-    parser.add_argument("--max_iterations", type=int, default=2500)
+    parser.add_argument("--max_iterations", type=int, default=5000)
     args = parser.parse_args()
 
     log_dir = f"logs/{args.exp_name}"

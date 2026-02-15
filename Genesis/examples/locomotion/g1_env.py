@@ -157,22 +157,26 @@ class G1Env:
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
 
-        # Phase tracking for gait coordination
-        self.gait_period = 0.8  # seconds
-        self.phase_offset = 0.5  # offset between left and right legs
-        self.phase = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
-        self.phase_left = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
-        self.phase_right = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
-
-        # Feet tracking for phase-based rewards
+        # Feet tracking for rewards
         self.feet_links = ["left_ankle_roll_link", "right_ankle_roll_link"]
         self.feet_link_idx = torch.tensor(
-            [self.robot.get_link(name).idx for name in self.feet_links],
+            [self.robot.get_link(name).idx_local for name in self.feet_links],
             dtype=gs.tc_int,
             device=gs.device,
         )
         self.feet_pos = torch.zeros((self.num_envs, 2, 3), dtype=gs.tc_float, device=gs.device)
         self.feet_heights = torch.zeros((self.num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        self.feet_vel = torch.zeros((self.num_envs, 2, 3), dtype=gs.tc_float, device=gs.device)
+        
+        # Contact tracking
+        self.contact_forces = torch.zeros((self.num_envs, 2, 3), dtype=gs.tc_float, device=gs.device)
+        self.foot_contact_weighted = torch.zeros((self.num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        
+        # Feet air time tracking
+        self.feet_air_time = torch.zeros((self.num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        self.last_contacts = torch.zeros((self.num_envs, 2), dtype=gs.tc_bool, device=gs.device)
+        self.feet_first_contact = torch.zeros((self.num_envs, 2), dtype=gs.tc_bool, device=gs.device)
+        self.latched_air_time = torch.zeros((self.num_envs, 2), dtype=gs.tc_float, device=gs.device)
 
         # Domain randomization - observation noise
         self.add_noise = self.randomization_cfg.get("add_noise", True)
@@ -188,13 +192,13 @@ class G1Env:
         })
         
         # Construct the noise vector (indices must match obs_buf concatenation order)
-        # 0:3 ang_vel, 3:6 gravity, 6:9 commands, 9:21 dof_pos, 21:33 dof_vel, 33:45 actions, 45:47 phase
+        # 0:3 ang_vel, 3:6 gravity, 6:9 commands, 9:21 dof_pos, 21:33 dof_vel, 33:45 actions
         self.noise_scale_vec[0:3] = noise_scales["ang_vel"]
         self.noise_scale_vec[3:6] = noise_scales["gravity"]
         self.noise_scale_vec[6:9] = noise_scales["commands"]
         self.noise_scale_vec[9:21] = noise_scales["dof_pos"]
         self.noise_scale_vec[21:33] = noise_scales["dof_vel"]
-        # No noise on actions (33:45) or phase (45:47)
+        # No noise on actions (33:45)
 
         # Domain randomization - pushing
         self.push_robots = self.randomization_cfg.get("push_robots", False)
@@ -248,16 +252,56 @@ class G1Env:
         self.dof_pos = self.robot.get_dofs_position(self.motors_dof_idx)
         self.dof_vel = self.robot.get_dofs_velocity(self.motors_dof_idx)
 
-        # Update gait phase
-        self.phase = (self.episode_length_buf * self.dt) % self.gait_period / self.gait_period
-        self.phase_left = self.phase
-        self.phase_right = (self.phase + self.phase_offset) % 1.0
-
-        # Update feet positions
+        # Update feet states
         for i, link_name in enumerate(self.feet_links):
-            self.feet_pos[:, i, :] = self.robot.get_link(link_name).get_pos()
+            link = self.robot.get_link(link_name)
+            self.feet_pos[:, i, :] = link.get_pos()
+            self.feet_vel[:, i, :] = link.get_vel()
         self.feet_heights[:, 0] = self.feet_pos[:, 0, 2]  # Left foot Z
         self.feet_heights[:, 1] = self.feet_pos[:, 1, 2]  # Right foot Z
+        
+        # Update contact forces and air time
+        # Get all link contact forces at once (shape: [n_envs, n_links, 3] or [n_links, 3])
+        all_contact_forces = self.robot.get_links_net_contact_force()
+        
+        for i, link_idx in enumerate(self.feet_link_idx):
+            # 1. Get Contact Data
+            # Extract contact force for this foot link
+            if all_contact_forces.dim() == 2:  # Single env case: [n_links, 3]
+                contact_force = all_contact_forces[link_idx:link_idx+1, :]
+            else:  # Multi env case: [n_envs, n_links, 3]
+                contact_force = all_contact_forces[:, link_idx, :]
+            
+            self.contact_forces[:, i, :] = contact_force
+            contact_norm = torch.norm(contact_force, dim=-1)
+            
+            # 2. Determine Contact State (Use a robust threshold like 5.0N)
+            in_contact = contact_norm > 5.0
+            self.foot_contact_weighted[:, i] = torch.clamp(contact_norm / 100.0, 0.0, 1.0)
+
+            # 3. Increment Air Time (Simulate time passing)
+            self.feet_air_time[:, i] += self.dt
+
+            # 4. Detect "First Contact" (Touchdown)
+            # True if we are touching now, but weren't touching last step
+            first_contact = in_contact & ~self.last_contacts[:, i]
+            self.feet_first_contact[:, i] = first_contact
+
+            # 5. Capture the Air Time (Latching)
+            # If we just landed, copy the current timer to the buffer.
+            # We do this BEFORE resetting the timer in step 6.
+            self.latched_air_time[:, i] = torch.where(
+                first_contact,
+                self.feet_air_time[:, i],
+                self.latched_air_time[:, i]
+            )
+
+            # 6. Reset Air Time
+            # If we are on the ground, reset timer to 0
+            self.feet_air_time[:, i] *= ~in_contact
+            
+            # 7. Update Last Contact for next step
+            self.last_contacts[:, i] = in_contact
 
         # compute reward
         self.rew_buf.zero_()
@@ -359,9 +403,6 @@ class G1Env:
         self._resample_commands(envs_idx)
 
     def _update_observation(self):
-        sin_phase = torch.sin(2 * torch.pi * self.phase).unsqueeze(1)
-        cos_phase = torch.cos(2 * torch.pi * self.phase).unsqueeze(1)
-        
         self.obs_buf = torch.concatenate(
             (
                 self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
@@ -370,8 +411,6 @@ class G1Env:
                 (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
                 self.dof_vel * self.obs_scales["dof_vel"],  # 12
                 self.actions,  # 12
-                sin_phase,  # 1
-                cos_phase,  # 1
             ),
             dim=-1,
         )
@@ -434,121 +473,111 @@ class G1Env:
             self.last_push_step[envs_to_push] = self.episode_length_buf[envs_to_push]
 
     # ------------ reward functions----------------
-    def _reward_tracking_lin_vel(self):
-        # Tracking of linear velocity commands (xy axes)
+    def _reward_LinVelXYReward(self):
+        """Reward tracking linear velocity commands (XY)"""
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
-        return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
+        return torch.exp(-lin_vel_error / self.reward_cfg.get("tracking_sigma", 0.25))
 
-    def _reward_tracking_ang_vel(self):
-        # Tracking of angular velocity commands (yaw)
+    def _reward_AngVelZReward(self):
+        """Reward tracking angular velocity command (Yaw)"""
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
-        return torch.exp(-ang_vel_error / self.reward_cfg["tracking_sigma"])
+        return torch.exp(-ang_vel_error / self.reward_cfg.get("tracking_sigma", 0.25))
     
-    def _reward_penalty_ang_vel_xy(self):
-        # Penalize angular velocity in roll and pitch for better stability
-        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+    def _reward_LinVelZPenalty(self):
+        """Penalize Z-axis base linear velocity"""
+        return -torch.square(self.base_lin_vel[:, 2])
     
-    def _reward_orientation(self):
-            # Penalize non-upright orientation for better stability
-            return torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+    def _reward_AngVelXYPenalty(self):
+        """Penalize angular velocity in roll and pitch"""
+        return -torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
     
-    def _reward_lin_vel_z(self):
-        # Penalize z axis base linear velocity
-        return torch.square(self.base_lin_vel[:, 2])
+    def _reward_OrientationPenalty(self):
+        """Penalize non-upright orientation"""
+        return -torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
     
-    def _reward_base_height(self):
-        # Penalize base height away from target
-        return torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
-
-    def _reward_action_rate(self):
-        # Penalize changes in actions
-        return torch.sum(torch.square(self.last_actions - self.actions), dim=1)
+    def _reward_ActionRatePenalty(self):
+        """Penalize changes in actions"""
+        return -torch.sum(torch.square(self.last_actions - self.actions), dim=1)
     
-    def _expected_foot_height(self, phase: torch.Tensor, swing_height: float) -> torch.Tensor:
-        """Calculate expected foot height based on gait phase.
-        
-        Args:
-            phase: Gait phase [0, 1]
-            swing_height: Maximum height during swing phase
-            
-        Returns:
-            Expected foot height
-        """
-        stance_offset = 0.035
-        # Stance phase (0 to 0.5): foot on ground
-        # Swing phase (0.5 to 1.0): foot lifts up and comes down
-        swing_phase = torch.clamp((phase - 0.5) * 2.0, 0.0, 1.0)  # Map [0.5, 1.0] to [0, 1]
-        
-        # Use sinusoidal trajectory for smooth foot movement
-        height = (swing_height * torch.sin(swing_phase * torch.pi)) + stance_offset
-        
-        return height
+    def _reward_ActionLimitPenalty(self):
+        """Penalize actions near limits"""
+        action_limit = self.reward_cfg.get("action_limit", 1.0)
+        near_limit = (torch.abs(self.actions) > action_limit * 0.9).float()
+        return -torch.sum(near_limit * torch.square(self.actions), dim=1)
     
-    def _reward_feet_phase(self):
-        """Reward for tracking desired foot height based on gait phase."""
-        swing_height = self.reward_cfg.get("swing_height", 0.08)
-        tracking_sigma = self.reward_cfg.get("tracking_sigma", 0.25)
-        
-        # Get foot heights (Z position)
-        foot_z_left = self.feet_heights[:, 0]
-        foot_z_right = self.feet_heights[:, 1]
-        
-        # Calculate expected foot heights based on phase
-        rz_left = self._expected_foot_height(self.phase_left, swing_height)
-        rz_right = self._expected_foot_height(self.phase_right, swing_height)
-        
-        # Calculate height tracking errors
-        error_left = torch.square(foot_z_left - rz_left)
-        error_right = torch.square(foot_z_right - rz_right)
-        
-        # Combine errors and apply exponential reward
-        total_error = error_left + error_right
-        
-        return torch.exp(-total_error / tracking_sigma)
+    def _reward_HipYawPenalty(self):
+        """Penalize hip yaw DOF positions (indices 2, 8)"""
+        # left_hip_yaw_joint, right_hip_yaw_joint
+        return -torch.sum(torch.abs(self.dof_pos[:, [2, 8]]), dim=-1)
     
-    def _reward_close_feet_xy(self):
-        """Penalize when feet are too close together in xy plane."""
-        close_feet_threshold = self.reward_cfg.get("close_feet_xy_threshold", 0.15)  # meters
+    def _reward_HipRollPenalty(self):
+        """Penalize hip roll DOF positions (indices 1, 7)"""
+        # left_hip_roll_joint, right_hip_roll_joint
+        return -torch.sum(torch.abs(self.dof_pos[:, [1, 7]]), dim=-1)
+    
+    def _reward_BodyRollPenalty(self):
+        """Penalize body roll"""
+        # Extract roll from euler angles
+        return -torch.square(self.base_euler[:, 0] * math.pi / 180.0)  # Convert to radians for penalty
+    
+    def _reward_FeetAirTimePenalty(self):
+        """Penalize feet air time deviation from target (only applied at moment of contact)"""
+        target_air_time = self.reward_cfg.get("target_feet_air_time", 0.4)
         
-        left_foot_xy = self.feet_pos[:, 0, :2]  # Left foot XY
-        right_foot_xy = self.feet_pos[:, 1, :2]  # Right foot XY
-
-        # Get base orientation - extract yaw from quaternion
-        # Base forward direction in world frame
-        base_forward_local = torch.tensor([1.0, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
-        base_forward = transform_by_quat(base_forward_local, self.base_quat)
-        base_yaw = torch.atan2(base_forward[:, 1], base_forward[:, 0])
-
-        # Calculate perpendicular distance in base-local coordinates
-        # This measures lateral distance between feet relative to robot's heading
-        feet_distance = torch.abs(
-            torch.cos(base_yaw) * (left_foot_xy[:, 1] - right_foot_xy[:, 1])
-            - torch.sin(base_yaw) * (left_foot_xy[:, 0] - right_foot_xy[:, 0])
+        # Compute penalty: absolute deviation from target, masked by first contact
+        pen_air_time = torch.sum(
+            torch.abs(self.latched_air_time - target_air_time) * self.feet_first_contact.float(), dim=1
         )
-
-        # Return penalty when feet are too close
-        return (feet_distance < close_feet_threshold).float()
+        return -pen_air_time
     
-    def _reward_penalty_feet_orientation(self):
-        """Penalize feet orientation deviation from flat on the ground."""
-        # Get foot quaternions using link names
+    def _reward_G1FeetSlidePenalty(self):
+        """Penalize feet sliding when in contact"""
+        # Check if feet are on ground
+        on_ground = self.foot_contact_weighted > 0.1
+        # Get XY velocity
+        feet_vel_xy = torch.norm(self.feet_vel[:, :, :2], dim=-1)
+        # Penalize sliding when on ground
+        return -torch.sum(on_ground * torch.square(feet_vel_xy), dim=1)
+    
+    def _reward_FeetOrientationPenalty(self):
+        """Penalize feet orientation deviation from flat"""
         left_foot_quat = self.robot.get_link(self.feet_links[0]).get_quat()
         right_foot_quat = self.robot.get_link(self.feet_links[1]).get_quat()
         
-        # Transform global gravity into each foot's local frame
         left_gravity_local = transform_by_quat(self.global_gravity, inv_quat(left_foot_quat))
         right_gravity_local = transform_by_quat(self.global_gravity, inv_quat(right_foot_quat))
         
-        # Penalize deviation from vertical (xy components should be zero if foot is flat)
-        left_deviation = torch.sqrt(torch.sum(torch.square(left_gravity_local[:, :2]), dim=1))
-        right_deviation = torch.sqrt(torch.sum(torch.square(right_gravity_local[:, :2]), dim=1))
+        # XY components should be zero if flat
+        left_dev = -torch.sum(torch.square(left_gravity_local[:, :2]), dim=1)
+        right_dev = -torch.sum(torch.square(right_gravity_local[:, :2]), dim=1)
         
-        return left_deviation + right_deviation
-
-    def _reward_torques(self):
-        # Penalize high torques - humanoids need smoother control
-        return torch.sum(torch.square(self.actions), dim=1)
-
-    def _reward_dof_acc(self):
-        # Penalize joint accelerations
-        return torch.sum(torch.square((self.dof_vel - self.last_dof_vel) / self.dt), dim=1)
+        return left_dev + right_dev
+    
+    def _reward_DofPosLimitPenalty(self):
+        """Penalize DOF positions near limits"""
+        # Get limits for all DOFs and index to get only the controlled joints
+        all_lower_limits = self.robot.get_dofs_limit()[0]
+        all_upper_limits = self.robot.get_dofs_limit()[1]
+        
+        # Extract limits for controlled joints only
+        lower_limits = all_lower_limits[self.motors_dof_idx]
+        upper_limits = all_upper_limits[self.motors_dof_idx]
+        
+        # Soft limit buffer (e.g., 90% of range)
+        # Penalize if we get within 10% of the hard limit
+        soft_ratio = 0.9
+        
+        # Check lower violation
+        # If limit is -1.0, soft is -0.9. If pos is -0.95, error is -0.05
+        out_of_limits = -(self.dof_pos - lower_limits * soft_ratio).clip(max=0.0)
+        
+        # Check upper violation
+        out_of_limits += (self.dof_pos - upper_limits * soft_ratio).clip(min=0.0)
+        
+        return -torch.sum(out_of_limits, dim=1)
+    
+    # def _reward_FeetContactForceLimitPenalty(self):
+    #     """Penalize feet contact forces above limit"""
+    #     force_limit = self.reward_cfg.get("contact_force_limit", 1.0)
+    #     above_limit = torch.clamp(self.foot_contact_weighted - force_limit, min=0.0)
+    #     return torch.sum(torch.square(above_limit), dim=1)
