@@ -130,7 +130,7 @@ def get_cfgs():
         "clip_actions": 100.0,
     }
     obs_cfg = {
-        "num_obs": 47,
+        "num_obs": 47,  # Updated: added 2 for sin/cos phase
         "obs_scales": {
             "lin_vel": 2.0,
             "ang_vel": 0.25,
@@ -141,37 +141,62 @@ def get_cfgs():
     reward_cfg = {
         "tracking_sigma": 0.25,
         "base_height_target": 0.78,
+        "close_feet_xy_threshold": 0.15,  # meters
+        "swing_height": 0.06,  # Maximum foot height during swing phase [m]
         "reward_scales": {
-            "tracking_lin_vel": 1.5,
-            "tracking_ang_vel": 0.5,
-            "lin_vel_z": -2.0,
-            "base_height": -30.0,
-            "action_rate": -0.01,
-            "similar_to_default": -0.2,
+            "tracking_lin_vel": 2.0,
+            "tracking_ang_vel": 1.5,
+            "penalty_ang_vel_xy": -1.0,
             "orientation": -5.0,
+            "lin_vel_z": -1.0,
+            "base_height": 0.0,
+            "action_rate": -0.01,
+            "feet_phase": 0.0,
+            "close_feet_xy": -10.0,
+            "penalty_feet_orientation": -5.0,
             "torques": -0.0001,
             "dof_acc": -2.5e-7,
         },
     }
     command_cfg = {
         "num_commands": 3,
-        "lin_vel_x_range": [0.3, 0.3],  # Start with slow forward walking
+        "lin_vel_x_range": [0.8, 0.8],  # Start with slow forward walking
         "lin_vel_y_range": [0.0, 0.0],
         "ang_vel_range": [0.0, 0.0],
     }
+    
+    randomization_cfg = {
+        "add_noise": False,
+        "noise_scales": {
+            "dof_pos": 0.01,    # +/- 0.01 rad
+            "dof_vel": 0.1,     # +/- 0.1 rad/s
+            "ang_vel": 0.2,     # +/- 0.2 rad/s
+            "gravity": 0.05,    # +/- 0.05
+            "commands": 0.0,    # No noise on commands
+        },
+        "randomize_friction": False,
+        "friction_range": [0.5, 1.25],
+        "randomize_base_mass": False,
+        "added_mass_range": [-1.0, 3.0],  # +/- kg
+        "randomize_motor_strength": False,
+        "motor_strength_range": [0.8, 1.2],  # +/- 20%
+        "push_robots": False,
+        "push_interval_s": 15,
+        "max_push_vel_xy": 1.0,  # m/s
+    }
 
-    return env_cfg, obs_cfg, reward_cfg, command_cfg
+    return env_cfg, obs_cfg, reward_cfg, command_cfg, randomization_cfg
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="g1-walking")
     parser.add_argument("-B", "--num_envs", type=int, default=4096)
-    parser.add_argument("--max_iterations", type=int, default=500)
+    parser.add_argument("--max_iterations", type=int, default=2500)
     args = parser.parse_args()
 
     log_dir = f"logs/{args.exp_name}"
-    env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
+    env_cfg, obs_cfg, reward_cfg, command_cfg, randomization_cfg = get_cfgs()
     train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
 
     if os.path.exists(log_dir):
@@ -179,14 +204,19 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
 
     pickle.dump(
-        [env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg],
+        [env_cfg, obs_cfg, reward_cfg, command_cfg, randomization_cfg, train_cfg],
         open(f"{log_dir}/cfgs.pkl", "wb"),
     )
 
     gs.init(backend=gs.gpu, precision="32", logging_level="warning", seed=train_cfg["seed"], performance_mode=True)
 
     env = G1Env(
-        num_envs=args.num_envs, env_cfg=env_cfg, obs_cfg=obs_cfg, reward_cfg=reward_cfg, command_cfg=command_cfg
+        num_envs=args.num_envs, 
+        env_cfg=env_cfg, 
+        obs_cfg=obs_cfg, 
+        reward_cfg=reward_cfg, 
+        command_cfg=command_cfg,
+        randomization_cfg=randomization_cfg
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
