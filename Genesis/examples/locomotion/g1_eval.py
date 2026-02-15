@@ -58,6 +58,9 @@ def main():
     randomization_cfg["add_noise"] = False
     randomization_cfg["push_robots"] = False
     reward_cfg["reward_scales"] = {}
+    
+    # Disable automatic command resampling for manual keyboard control
+    env_cfg["enable_command_resampling"] = False
 
     env = G1Env(
         num_envs=1,
@@ -159,6 +162,7 @@ def main():
                 if dones[0]:
                     print("Episode finished, resetting...")
                     obs, _ = env.reset()
+                    update_command(0,0,0)  # Reset commands on episode end
     except KeyboardInterrupt:
         print("\nSimulation interrupted by user")
     finally:

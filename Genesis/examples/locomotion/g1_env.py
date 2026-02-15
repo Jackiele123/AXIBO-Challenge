@@ -29,6 +29,9 @@ class G1Env:
         self.reward_cfg = reward_cfg
         self.command_cfg = command_cfg
         self.randomization_cfg = randomization_cfg or {}
+        
+        # Enable command resampling by default (can be disabled for evaluation)
+        self.enable_command_resampling = env_cfg.get("enable_command_resampling", True)
 
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = reward_cfg["reward_scales"]
@@ -314,8 +317,9 @@ class G1Env:
         if self.push_robots:
             self._push_robots()
 
-        # resample commands
-        self._resample_commands(self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
+        # resample commands (only if enabled)
+        if self.enable_command_resampling:
+            self._resample_commands(self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
 
         # check termination and reset - humanoids are more sensitive to orientation
         self.reset_buf = self.episode_length_buf > self.max_episode_length
