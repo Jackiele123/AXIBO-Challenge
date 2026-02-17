@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--ckpt", type=int, default=499)
     args = parser.parse_args()
 
-    gs.init(backend=gs.cpu)
+    gs.init(backend=gs.cpu, logging_level="CRITICAL", logger_verbose_time=False, performance_mode=False)
 
     log_dir = f"logs/{args.exp_name}"
     cfg_data = pickle.load(open(f"logs/{args.exp_name}/cfgs.pkl", "rb"))

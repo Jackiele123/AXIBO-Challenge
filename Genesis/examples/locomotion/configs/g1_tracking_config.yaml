@@ -1,0 +1,209 @@
+# G1 Humanoid Motion Tracking Configuration
+# For high-fidelity motion imitation using reference motion data
+
+env:
+  num_actions: 12
+  episode_length_s: 7.6  # Match motion duration (607 frames / 80 fps)
+  resampling_time_s: 10.0  # Disable for tracking
+  enable_command_resampling: false  # Disable command resampling
+  action_scale: 0.25
+  simulate_action_latency: true
+  clip_actions: 100.0
+  
+  # Termination conditions (looser for tracking)
+  termination_if_roll_greater_than: 40  # degrees
+  termination_if_pitch_greater_than: 40  # degrees
+  termination_if_base_height_less_than: 0.3  # meters
+  
+  # Initial pose
+  base_init_pos: [0.0, 0.0, 0.80]
+  base_init_quat: [1.0, 0.0, 0.0, 0.0]
+  
+  # Default joint angles (rad) - will be overridden by reference motion
+  default_joint_angles:
+    left_hip_pitch_joint: -0.1
+    left_hip_roll_joint: 0.0
+    left_hip_yaw_joint: 0.0
+    left_knee_joint: 0.3
+    left_ankle_pitch_joint: -0.2
+    left_ankle_roll_joint: 0.0
+    right_hip_pitch_joint: -0.1
+    right_hip_roll_joint: 0.0
+    right_hip_yaw_joint: 0.0
+    right_knee_joint: 0.3
+    right_ankle_pitch_joint: -0.2
+    right_ankle_roll_joint: 0.0
+  
+  # Joint names (order matters - must match NPZ data)
+  joint_names:
+    - left_hip_pitch_joint
+    - left_hip_roll_joint
+    - left_hip_yaw_joint
+    - left_knee_joint
+    - left_ankle_pitch_joint
+    - left_ankle_roll_joint
+    - right_hip_pitch_joint
+    - right_hip_roll_joint
+    - right_hip_yaw_joint
+    - right_knee_joint
+    - right_ankle_pitch_joint
+    - right_ankle_roll_joint
+  
+  # PD gains (joint-specific)
+  stiffness:
+    hip_yaw: 100
+    hip_roll: 100
+    hip_pitch: 100
+    knee: 150
+    ankle: 40
+  
+  damping:
+    hip_yaw: 2
+    hip_roll: 2
+    hip_pitch: 2
+    knee: 4
+    ankle: 2
+
+observation:
+  # New observation structure for motion tracking:
+  # Components: last_action(12) + dof_pos(12) + dof_vel(12) + base_ang_vel_local(3) + 
+  #             diff_base_yaw(1) + diff_base_pos_local_yaw(3) + 
+  #             diff_tracking_link_pos_local_yaw(6) + diff_tracking_link_rotation_6D(12) + 
+  #             projected_gravity(3) + motion_obs(varies)
+  num_obs: 64  # Will be computed based on motion_obs size
+  obs_scales:
+    lin_vel: 2.0
+    ang_vel: 0.25
+    dof_pos: 1.0
+    dof_vel: 0.05
+  
+  # motion_obs configuration: specifies which future frames to observe
+  motion_obs:
+    observed_steps: []  # Time offsets in seconds, e.g., [0.1, 0.2, 0.3]
+
+commands:
+  num_commands: 3
+  # Commands are less important for motion tracking
+  lin_vel_x_range: [0.0, 0.0]
+  lin_vel_y_range: [0.0, 0.0]
+  ang_vel_range: [0.0, 0.0]
+
+# Motion tracking configuration
+tracking:
+  # Path to reference motion NPZ file (relative to script location)
+  motion_file: "/home/jackiele/projects/AXIBO-Challenge/Genesis/examples/locomotion/configs/walk_jump_bothfeet_4_small_12dof_80fps.npz"
+  # Tracking link names (for end-effector tracking)
+  tracking_link_names:
+    - left_ankle_roll_link
+    - right_ankle_roll_link
+  
+  # Observation settings
+  include_ref_states: true      # Include ref_dof_pos, ref_dof_vel
+  include_phase: true            # Include sin(phase), cos(phase)
+  include_tracking_error: false  # Include diff_dof_pos
+  
+  # Reset settings
+  hard_reset_ratio: 0.8  # 80% of resets sync to reference exactly
+  match_motion_duration: true  # Set episode length to motion duration
+  
+  # Termination thresholds for tracking errors
+  termination_thresholds:
+    joint_pos_error: 5.0      # Sum of joint position errors (rad)
+    base_height_error: 0.5     # Base height error (m)
+
+# Reward configuration - MOTION TRACKING
+rewards:
+  # Reward scales
+  scales:
+    # === Motion Tracking Rewards ===
+    DofPosReward: 1.0                           # Joint position tracking
+    DofVelReward: 0.01                          # Joint velocity tracking
+    BaseHeightReward: 100.0                     # Base height tracking
+    BaseQuatReward: 20.0                        # Base orientation tracking
+    BaseAngVelReward: 0.2                       # Base angular velocity tracking
+    TrackingLinkPosGlobalReward: 0.05          # Global tracking link position
+    TrackingLinkPosLocalReward: 30.0           # Local tracking link position
+    TrackingLinkQuatReward: 1.0                # Tracking link orientation
+    TrackingLinkLinVelReward: 1.0              # Tracking link linear velocity
+    
+    # === Regularization Penalties ===
+    TorquePenalty: 0.0001                       # Minimize torques
+    DofVelPenalty: 0.02                         # Minimize joint velocities
+    ActionRatePenalty: 0.2                      # Smooth actions
+    ActionLimitPenalty: 0.1                     # Avoid action limits
+    AnkleTorquePenalty: 0.003                   # Minimize ankle torques
+    BodyAngVelXYPenalty: 0.3                    # Minimize body roll/pitch rates
+    BodyRollPenalty: 2.0                       # Minimize body roll
+    HipRollPenalty: 1.0                         # Minimize hip roll
+    G1FeetSlidePenalty: 3.0                     # Penalize foot sliding
+    MotionFeetAirTimePenalty: 0.0            # Penalize incorrect air time
+  
+  # Reward parameters (sigma values for exponential rewards)
+  parameters:
+    # Tracking sigmas (smaller = tighter tracking)
+    joint_pos_tracking_sigma: 0.05    # Very tight joint tracking
+    joint_vel_tracking_sigma: 0.5     # Moderate velocity tracking
+    base_height_tracking_sigma: 0.1   # Tight height tracking
+    base_pos_tracking_sigma: 0.25     # Moderate position tracking
+    end_effector_tracking_sigma: 0.08 # Tight end-effector tracking
+    
+    # Legacy parameters
+    tracking_sigma: 0.25
+    base_height_target: 0.75
+    target_feet_air_time: 0.4
+    feet_height_target: 0.2
+    action_limit: 1.0
+    contact_force_limit: 1.0
+
+# Domain randomization (DISABLED for initial tracking training)
+randomization:
+  add_noise: false
+  noise_scales:
+    dof_pos: 0.0
+    dof_vel: 0.0
+    ang_vel: 0.0
+    gravity: 0.0
+    commands: 0.0
+  
+  randomize_friction: false
+  friction_range: [0.5, 1.25]
+  
+  randomize_base_mass: false
+  added_mass_range: [-1.0, 3.0]
+  
+  randomize_motor_strength: false
+  motor_strength_range: [0.8, 1.2]
+  
+  push_robots: false
+  push_interval_s: 15
+  max_push_vel_xy: 1.0
+
+# Training configuration (tuned for tracking)
+training:
+  algorithm:
+    class_name: PPO
+    clip_param: 0.2
+    desired_kl: 0.01
+    entropy_coef: 0.005     # Lower entropy for more deterministic tracking
+    gamma: 0.99
+    lam: 0.95
+    learning_rate: 0.0005   # Lower LR for stable tracking
+    max_grad_norm: 1.0
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    schedule: adaptive
+    use_clipped_value_loss: true
+    value_loss_coef: 1.0
+  
+  policy:
+    activation: elu
+    actor_hidden_dims: [512, 256, 128]  # Larger network for complex motion
+    critic_hidden_dims: [512, 256, 128]
+    init_noise_std: 0.5    # Lower initial noise for tracking
+    class_name: ActorCritic
+  
+  runner:
+    num_steps_per_env: 24
+    save_interval: 100
+    log_interval: 1
+    seed: 1

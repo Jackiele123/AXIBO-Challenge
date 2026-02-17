@@ -523,15 +523,48 @@ class G1Env:
         """Penalize body roll"""
         # Extract roll from euler angles
         return -torch.square(self.base_euler[:, 0] * math.pi / 180.0)  # Convert to radians for penalty
-    
-    def _reward_FeetAirTimePenalty(self):
-        """Penalize feet air time deviation from target (only applied at moment of contact)"""
-        target_air_time = self.reward_cfg.get("target_feet_air_time", 0.4)
+    # def _reward_FeetAirTimePenalty(self):
+    #     """Penalize feet air time deviation from target (only applied at moment of contact)"""
+    #     target_air_time = self.reward_cfg.get("target_feet_air_time", 0.4)
         
-        # Compute penalty: absolute deviation from target, masked by first contact
-        pen_air_time = torch.sum(
-            torch.abs(self.latched_air_time - target_air_time) * self.feet_first_contact.float(), dim=1
-        )
+    #     # Compute penalty: absolute deviation from target, masked by first contact
+    #     pen_air_time = torch.sum(
+    #         torch.abs(self.latched_air_time - target_air_time) * self.feet_first_contact.float(), dim=1
+    #     )
+    #     return -pen_air_time
+    def _reward_FeetAirTimePenalty(self):
+        """
+        Adaptive Air Time Penalty (Inverse scaling).
+        1. Only applies when moving (cmd > 0.1).
+        2. Target scales INVERSELY with speed: 
+           - 0.6s at 0.0 m/s (Slow swings)
+           - 0.2s at 1.5 m/s (Fast, rapid stepping)
+        """
+        # Calculate command speed (XY magnitude)
+        cmd_mag = torch.norm(self.commands[:, :2], dim=1)
+        
+        # 1. Mask: Only penalize if we WANT to walk (cmd > 0.1 m/s)
+        is_moving_cmd = cmd_mag > 0
+        
+        # 2. Adaptive Target Calculation
+        # Clamp speed to 1.5 max
+        speed_ratio = torch.clamp(cmd_mag / 1.5, 0.0, 1.0)
+        
+        # Inverse Interpolation: Start at 0.8, subtract up to 0.6 to reach 0.2
+        # Ratio 0.0 -> 1.0 - 0.0 = 1.0s
+        # Ratio 1.0 -> 1.0 - 0.8 = 0.2s
+        adaptive_target = 0.6 - (speed_ratio * 0.4)
+        
+        # Expand target to shape [num_envs, 2]
+        target_air_time = adaptive_target.unsqueeze(1).repeat(1, 2)
+        
+        # 3. Calculate Reward
+        air_time_error = torch.abs(self.latched_air_time - target_air_time)
+        
+        # Mask by first_contact AND is_moving_cmd
+        valid_mask = self.feet_first_contact & is_moving_cmd.unsqueeze(1)
+        
+        pen_air_time = torch.sum(air_time_error * valid_mask.float(), dim=1)
         return -pen_air_time
     
     def _reward_G1FeetSlidePenalty(self):
@@ -580,6 +613,50 @@ class G1Env:
         
         return -torch.sum(out_of_limits, dim=1)
     
+    def _reward_StraightKneeStandReward(self):
+        """
+        Encourages straight knees (0.0 rad) ONLY when standing still.
+        Prevents the robot from crouching while waiting for commands.
+        """
+        # Define "Standing Still" command threshold
+        is_standing = torch.norm(self.commands[:, :2], dim=1) < 0.1
+        
+        # Get Knee Indices (G1 12-DOF standard order: HipP, HipR, HipY, Knee...)
+        # Indices: Left Knee = 3, Right Knee = 9
+        knee_indices = [3, 9]
+        knee_pos = self.dof_pos[:, knee_indices]
+        
+        # Calculate deviation from 0.0 (Straight)
+        # We assume 0.0 is straight in the URDF. If straight is 0.3, change target here.
+        knee_error = torch.sum(torch.square(knee_pos), dim=1)
+        
+        # Only apply penalty when standing
+        return -knee_error * is_standing.float()
+    
+    def _reward_HeelStrikePenalty(self):
+        """
+        Encourages Heel-First contact.
+        At the moment of impact (first_contact), the foot pitch should be positive (toes up).
+        """
+        # 1. Get Foot Orientation
+        left_foot_quat = self.robot.get_link(self.feet_links[0]).get_quat()
+        right_foot_quat = self.robot.get_link(self.feet_links[1]).get_quat()
+        
+        # Convert to Euler [Roll, Pitch, Yaw]
+        left_rpy = quat_to_xyz(left_foot_quat, rpy=True)
+        right_rpy = quat_to_xyz(right_foot_quat, rpy=True)
+        
+        # Stack pitches: Shape [num_envs, 2]
+        foot_pitch = torch.stack([left_rpy[:, 1], right_rpy[:, 1]], dim=1)
+    
+        target_heel_pitch = 0.4 
+        # 3. Calculate Error
+        # We only care if pitch is LESS than target (flat or toes down). 
+        # If pitch is > 0.4 (super toes up), that's fine/exaggerated but acceptable.
+        pitch_error = torch.square(torch.clamp(target_heel_pitch - foot_pitch, min=0.0))
+        
+        # 4. Apply only on First Contact
+        return -torch.sum(pitch_error * self.feet_first_contact.float(), dim=1)
     # def _reward_FeetContactForceLimitPenalty(self):
     #     """Penalize feet contact forces above limit"""
     #     force_limit = self.reward_cfg.get("contact_force_limit", 1.0)
