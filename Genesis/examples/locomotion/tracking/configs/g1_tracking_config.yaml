@@ -9,8 +9,8 @@ env:
   base_init_quat: [1.0, 0.0, 0.0, 0.0]
 
   # Termination (looser than G1Env — allow jump dynamics)
-  termination_if_roll_greater_than: 40   # degrees
-  termination_if_pitch_greater_than: 40  # degrees
+  termination_if_roll_greater_than: 60   # degrees
+  termination_if_pitch_greater_than: 60  # degrees
   termination_if_base_height_less_than: 0.20  # metres (allows jump)
 
   # Default joint angles (rad) — same as G1Env
@@ -75,13 +75,19 @@ env:
     ankle:     2
 
 observation:
-  # 6 anchor_ori + 3 lin_vel + 3 ang_vel + 39 body_pos + 78 body_ori + 3 mot_anchor_pos + 6 mot_anchor_ori
-  num_obs: 138
+  # Matches IsaacLab BeyondMimic ObservationsCfg exactly.
+  # Policy  (actor):    command(2)+anc_pos(3)+anc_ori(6)+lin_vel(3)+ang_vel(3)+jpos(12)+jvel(12)+act(12) = 53
+  # Critic (privileged): command(2)+anc_pos(3)+anc_ori(6)+bpos(39)+bori(78)+lin_vel(3)+ang_vel(3)+jpos(12)+jvel(12)+act(12) = 170
+  num_obs: 53
+  num_privileged_obs: 170
+  add_noise: true    # matches PolicyCfg enable_corruption=True; set false in eval
   obs_scales:
-    lin_vel:    0.2    # world-frame linear velocity  (±5 m/s → ±1.0)
-    ang_vel:    0.1    # world-frame angular velocity  (±10 rad/s → ±1.0)
-    body_pos:   0.5    # body positions in anchor frame (±1.5 m → ±0.75)
-    anchor_pos: 0.2    # motion anchor position in robot frame (±2 m → ±0.4)
+    lin_vel:    0.2     # body-frame linear velocity  (±5 m/s → ±1.0)
+    ang_vel:    0.25    # body-frame angular velocity  (±4 rad/s → ±1.0)
+    dof_pos:    1.0     # joint position delta relative to default
+    dof_vel:    0.05    # joint velocity (±20 rad/s → ±1.0)
+    anchor_pos: 0.2     # motion anchor position in robot frame (±2 m → ±0.4)
+    body_pos:   0.5     # body positions in anchor frame (±1.5 m → ±0.75)
 
 motion:
   file: "tracking/configs/walk_jump_bothfeet_4_small_12dof_80fps.npz"

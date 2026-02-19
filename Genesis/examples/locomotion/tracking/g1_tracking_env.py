@@ -1,15 +1,24 @@
 """G1TrackingEnv — BeyondMimic-style motion-tracking environment.
 
-Observation vector (138 dims):
-  robot_anchor_ori_w      6   2-column rotation matrix of robot anchor (heading)
-  robot_anchor_lin_vel_w  3   pelvis linear velocity (world frame)
-  robot_anchor_ang_vel_w  3   pelvis angular velocity (world frame)
-  robot_body_pos_b       39   13 bodies × 3 – positions in robot anchor frame
-  robot_body_ori_b       78   13 bodies × 6 – 2-col rotation mats in anchor frame
-  motion_anchor_pos_b     3   motion anchor position relative to robot anchor
-  motion_anchor_ori_b     6   motion anchor orientation relative to robot anchor
-  ─────────────────────────
-  Total                 138
+Asymmetric actor-critic observation design:
+
+  Policy obs (actor, 51 dims) — minimal, noisy-compatible:
+    motion_anchor_pos_b     3   motion anchor XY+Z in robot anchor frame (scaled)
+    motion_anchor_ori_b     6   motion anchor orientation (2-col rotation matrix)
+    base_lin_vel            3   pelvis linear velocity in body frame (scaled)
+    base_ang_vel            3   pelvis angular velocity in body frame (scaled)
+    dof_pos_delta          12   (joint_pos − default) scaled
+    dof_vel                12   joint velocities scaled
+    last_actions           12   previous action
+    ─────────────────────────
+    Total                  51
+
+  Privileged obs (critic, 168 dims) — full body-space state:
+    [all 51 policy dims]   51
+    robot_body_pos_b       39   13 bodies × 3 in anchor-yaw frame (scaled)
+    robot_body_ori_b       78   13 bodies × 6 (2-col rotation matrices)
+    ─────────────────────────
+    Total                 168
 
 Reward terms (auto-discovered by _reward_ prefix, all scaled × dt):
   GlobalAnchorPositionTracking     – global pelvis XY tracking
@@ -33,7 +42,7 @@ import torch
 import genesis as gs
 from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat, transform_quat_by_quat
 
-from tracking.motion_lib import (
+from motion_lib import (
     MotionLib,
     yaw_quat_from_quat,
     rot_mat_2col,
@@ -61,9 +70,10 @@ class G1TrackingEnv:
         show_viewer: bool = False,
     ):
         self.num_envs = num_envs
-        self.num_obs = obs_cfg["num_obs"]           # 138
-        self.num_privileged_obs = None
-        self.num_actions = env_cfg["num_actions"]   # 12
+        self.num_obs = obs_cfg["num_obs"]                          # 53
+        self.num_privileged_obs = obs_cfg.get("num_privileged_obs")  # 170
+        self.num_actions = env_cfg["num_actions"]                  # 12
+        self.add_noise = obs_cfg.get("add_noise", True)            # matches enable_corruption
         self.device = gs.device
 
         self.simulate_action_latency = True
@@ -100,10 +110,11 @@ class G1TrackingEnv:
 
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
-                file="../g1_files/g1_12dof_package/g1_12dof/g1_12dof.urdf",
+                file="/home/jackiele/projects/AXIBO-Challenge/g1_files/g1_12dof_package/g1_12dof/g1_12dof.urdf",
+                #The folder structure is messing up relative paths, using absolute path to save time.
                 pos=self.env_cfg["base_init_pos"],
                 quat=self.env_cfg["base_init_quat"],
-            )
+            ),
         )
 
         self.scene.build(n_envs=num_envs)
@@ -174,6 +185,8 @@ class G1TrackingEnv:
         d = gs.device
 
         self.obs_buf           = torch.zeros((N, self.num_obs),   dtype=f, device=d)
+        priv_dim = self.num_privileged_obs if self.num_privileged_obs is not None else self.num_obs
+        self.privileged_obs_buf = torch.zeros((N, priv_dim),     dtype=f, device=d)
         self.rew_buf           = torch.zeros((N,),                dtype=f, device=d)
         self.reset_buf         = torch.ones((N,),                 dtype=gs.tc_bool, device=d)
         self.episode_length_buf = torch.zeros((N,),               dtype=gs.tc_int,  device=d)
@@ -215,8 +228,8 @@ class G1TrackingEnv:
         self.robot_body_quat_relative_w = torch.zeros((N, B, 4), dtype=f, device=d)
 
         # Motion time per env
-        self.motion_time   = torch.zeros((N,),  dtype=f, device=d)
-        self.start_frame   = torch.zeros((N,),  dtype=gs.tc_int, device=d)
+        self.motion_time   = torch.zeros((N,),  dtype=f,          device=d)
+        self.start_frame   = torch.zeros((N,),  dtype=torch.long, device=d)
 
         # Contact tracking for FeetContactTime reward
         self.last_contacts         = torch.zeros((N, 2), dtype=gs.tc_bool, device=d)
@@ -245,11 +258,13 @@ class G1TrackingEnv:
         return self.obs_buf, None
 
     def get_observations(self):
-        self.extras["observations"]["critic"] = self.obs_buf
+        self.extras["observations"]["critic"] = (
+            self.privileged_obs_buf if self.num_privileged_obs is not None else self.obs_buf
+        )
         return self.obs_buf, self.extras
 
     def get_privileged_observations(self):
-        return None
+        return self.privileged_obs_buf if self.num_privileged_obs is not None else None
 
     # ────────────────────────────────────────────────────────────────────────
     # Step
@@ -305,7 +320,7 @@ class G1TrackingEnv:
         ).reshape(N, B, 3)
 
         # body_quat_relative_w = inv_anchor_quat * body_quat
-        from tracking.motion_lib import _quat_mul
+        from motion_lib import _quat_mul
         bq_flat = self.all_body_quat.reshape(N * B, 4)
         self.robot_body_quat_relative_w = _quat_mul(inv_aq_exp, bq_flat).reshape(N, B, 4)
 
@@ -353,7 +368,9 @@ class G1TrackingEnv:
         self._update_observation()
 
         self.last_actions.copy_(self.actions)
-        self.extras["observations"]["critic"] = self.obs_buf
+        self.extras["observations"]["critic"] = (
+            self.privileged_obs_buf if self.num_privileged_obs is not None else self.obs_buf
+        )
 
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
@@ -466,68 +483,111 @@ class G1TrackingEnv:
     # ────────────────────────────────────────────────────────────────────────
 
     def _update_observation(self):
-        """Build 138-dim BeyondMimic observation vector.
+        """Build observations matching IsaacLab BeyondMimic ObservationsCfg exactly.
 
-        Scaling applied to non-bounded components so all obs entries land in
-        approximately [−1, +1] for the first network layer:
-          lin_vel   × 0.2   (±5 m/s walking+jump → ±1.0)
-          ang_vel   × 0.1   (±10 rad/s landing   → ±1.0)
-          body_pos  × 0.5   (±1.5 m anchor frame  → ±0.75)
-          anchor_pos× 0.2   (±2 m drift possible  → ±0.4)
-        Rotation-matrix components are already in [−1, +1] — no scaling.
+        PolicyCfg (actor, 53 dims) — with uniform noise when self.add_noise:
+          command              2   phase [sin, cos] of motion_time/duration × 2π
+          motion_anchor_pos_b  3   motion anchor pos in robot frame + noise ±0.25 m
+          motion_anchor_ori_b  6   motion anchor ori (2-col R) + noise ±0.05
+          base_lin_vel         3   body-frame lin vel + noise ±0.5 m/s
+          base_ang_vel         3   body-frame ang vel + noise ±0.2 rad/s
+          joint_pos           12   (dof_pos − default) + noise ±0.01 rad
+          joint_vel           12   dof_vel + noise ±0.5 rad/s
+          actions             12   last_action (no noise)
+          Total               53
+
+        PrivilegedCfg (critic, 170 dims) — no noise:
+          command              2
+          motion_anchor_pos_b  3
+          motion_anchor_ori_b  6
+          body_pos            39   robot_body_pos_b: 13 bodies in anchor-yaw frame
+          body_ori            78   robot_body_ori_b: 13 bodies 2-col R
+          base_lin_vel         3
+          base_ang_vel         3
+          joint_pos           12
+          joint_vel           12
+          actions             12
+          Total              170
         """
         N, B = self.num_envs, self.num_bodies
 
         lin_vel_scale  = self.obs_scales.get("lin_vel",    0.2)
-        ang_vel_scale  = self.obs_scales.get("ang_vel",    0.1)
-        body_pos_scale = self.obs_scales.get("body_pos",   0.5)
+        ang_vel_scale  = self.obs_scales.get("ang_vel",    0.25)
+        dof_pos_scale  = self.obs_scales.get("dof_pos",    1.0)
+        dof_vel_scale  = self.obs_scales.get("dof_vel",    0.05)
         anc_pos_scale  = self.obs_scales.get("anchor_pos", 0.2)
+        body_pos_scale = self.obs_scales.get("body_pos",   0.5)
 
-        # 1. robot_anchor_ori_w  (6) – 2-col rotation matrix of anchor heading
-        anchor_ori = rot_mat_2col(self.robot_anchor_quat)                      # (N, 6)
+        # Uniform-noise helper (noise applied to unscaled values, matching IsaacLab Unoise)
+        nmag = 1.0 if self.add_noise else 0.0
+        def unoise(t: torch.Tensor, mag: float) -> torch.Tensor:
+            return t + (torch.rand_like(t) * 2.0 - 1.0) * (mag * nmag)
 
-        # 2. robot_anchor_lin_vel_w  (3) – pelvis linear velocity (world frame)
-        robot_lin_vel_w = self.robot.get_vel() * lin_vel_scale                 # (N, 3)
+        # ── command: phase encoding (2) ───────────────────────────────────────
+        phase = (self.motion_time / self.motion_lib.duration) * (2.0 * math.pi)
+        command = torch.stack([torch.sin(phase), torch.cos(phase)], dim=-1)  # (N, 2)
 
-        # 3. robot_anchor_ang_vel_w  (3) – pelvis angular velocity (world frame)
-        robot_ang_vel_w = self.robot.get_ang() * ang_vel_scale                 # (N, 3)
-
-        # 4. robot_body_pos_b  (N, 13, 3) → flatten to (N, 39)
-        body_pos_b = (
-            self.robot_body_pos_relative_w.reshape(N, B * 3) * body_pos_scale
-        )
-
-        # 5. robot_body_ori_b  (N, 13, 6) → flatten to (N, 78)
-        body_ori_b = rot_mat_2col(
-            self.robot_body_quat_relative_w.reshape(N * B, 4)
-        ).reshape(N, B * 6)
-
-        # 6. motion_anchor_pos_b  (3) – motion anchor position in robot anchor frame
-        mot_anchor_pos_b, _ = subtract_frame_transforms(
-            self.robot_anchor_pos,
-            self.robot_anchor_quat,
-            self.ref_anchor_pos_w,
-        )                                                                         # (N, 3)
-        mot_anchor_pos_b = mot_anchor_pos_b * anc_pos_scale
-
-        # 7. motion_anchor_ori_b  (6) – motion anchor orientation in robot anchor frame
-        _, mot_anchor_quat_b = subtract_frame_transforms(
+        # ── motion_anchor_pos_b, motion_anchor_ori_b: raw (unscaled) ─────────
+        mot_anchor_pos_raw, mot_anchor_quat_b = subtract_frame_transforms(
             self.robot_anchor_pos,
             self.robot_anchor_quat,
             self.ref_anchor_pos_w,
             self.ref_anchor_quat_w,
-        )
-        mot_anchor_ori_b = rot_mat_2col(mot_anchor_quat_b)                       # (N, 6)
+        )                                                       # (N, 3), (N, 4)
+        mot_anchor_ori_raw = rot_mat_2col(mot_anchor_quat_b)   # (N, 6)
 
+        # ── base_lin_vel, base_ang_vel: body frame, unscaled ─────────────────
+        lin_vel_raw = self.base_lin_vel   # (N, 3)  body frame, m/s
+        ang_vel_raw = self.base_ang_vel   # (N, 3)  body frame, rad/s
+
+        # ── joint_pos (relative to default), joint_vel ───────────────────────
+        joint_pos_raw = self.dof_pos - self.default_dof_pos    # (N, 12)
+        joint_vel_raw = self.dof_vel                           # (N, 12)
+
+        # ── Policy obs (53 dims, with noise) ─────────────────────────────────
         self.obs_buf = torch.cat([
-            anchor_ori,          # 6
-            robot_lin_vel_w,     # 3
-            robot_ang_vel_w,     # 3
-            body_pos_b,          # 39
-            body_ori_b,          # 78
-            mot_anchor_pos_b,    # 3
-            mot_anchor_ori_b,    # 6
-        ], dim=-1)               # 138
+            command,                                                  # 2
+            unoise(mot_anchor_pos_raw, 0.25) * anc_pos_scale,        # 3
+            unoise(mot_anchor_ori_raw, 0.05),                         # 6
+            unoise(lin_vel_raw,  0.5)  * lin_vel_scale,               # 3
+            unoise(ang_vel_raw,  0.2)  * ang_vel_scale,               # 3
+            unoise(joint_pos_raw, 0.01) * dof_pos_scale,              # 12
+            unoise(joint_vel_raw, 0.5)  * dof_vel_scale,              # 12
+            self.last_actions,                                        # 12
+        ], dim=-1)                                                    # 53
+
+        # ── Privileged / critic obs (170 dims, no noise) ─────────────────────
+        if self.num_privileged_obs is not None:
+            body_pos_b_flat = (
+                self.robot_body_pos_relative_w.reshape(N, B * 3) * body_pos_scale
+            )                                                         # (N, 39)
+            body_ori_b_flat = rot_mat_2col(
+                self.robot_body_quat_relative_w.reshape(N * B, 4)
+            ).reshape(N, B * 6)                                       # (N, 78)
+
+            self.privileged_obs_buf = torch.cat([
+                command,                                              # 2
+                mot_anchor_pos_raw * anc_pos_scale,                   # 3
+                mot_anchor_ori_raw,                                   # 6
+                body_pos_b_flat,                                      # 39
+                body_ori_b_flat,                                      # 78
+                lin_vel_raw  * lin_vel_scale,                         # 3
+                ang_vel_raw  * ang_vel_scale,                         # 3
+                joint_pos_raw * dof_pos_scale,                        # 12
+                joint_vel_raw * dof_vel_scale,                        # 12
+                self.last_actions,                                    # 12
+            ], dim=-1)                                                # 170
+
+        # ── Removed obs terms — kept as comments for future use ───────────────
+        #
+        # Robot anchor orientation (6): 2-col rotation matrix of robot heading.
+        # Was obs component 1 in the original 138-dim all-body obs design.
+        #   anchor_ori = rot_mat_2col(self.robot_anchor_quat)         # (N, 6)
+        #
+        # World-frame pelvis velocity (6): used in the original 138-dim obs.
+        # Replaced by body-frame base_lin_vel / base_ang_vel above.
+        #   robot_lin_vel_w = self.robot.get_vel() * lin_vel_scale    # (N, 3)
+        #   robot_ang_vel_w = self.robot.get_ang() * ang_vel_scale    # (N, 3)
 
     # ────────────────────────────────────────────────────────────────────────
     # Contact state

@@ -1,11 +1,10 @@
 """Evaluation / visualisation for the G1 BeyondMimic tracking policy.
 
-The motion drives itself — no keyboard velocity control needed.
+The motion drives itself and loops automatically when it completes.
 Phase progress and per-body tracking RMSE are printed each step.
 
 Usage (from tracking/):
     python g1_tracking_eval.py -e g1-tracking --ckpt 499
-    python g1_tracking_eval.py -e g1-tracking --ckpt 499 --loop
 
 Press ESC in the viewer to quit.
 """
@@ -36,16 +35,14 @@ except (metadata.PackageNotFoundError, ImportError) as e:
 from rsl_rl.runners import OnPolicyRunner
 import genesis as gs
 
-from tracking.g1_tracking_env import G1TrackingEnv
-from tracking.motion_lib import quat_error_magnitude
+from g1_tracking_env import G1TrackingEnv
+from motion_lib import quat_error_magnitude
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="g1-tracking")
     parser.add_argument("--ckpt",           type=int, default=499)
-    parser.add_argument("--loop",           action="store_true",
-                        help="Restart from frame 0 when sequence ends")
     args = parser.parse_args()
 
     gs.init(backend=gs.cpu, logging_level="CRITICAL")
@@ -54,8 +51,9 @@ def main():
     cfg_data = pickle.load(open(f"{log_dir}/cfgs.pkl", "rb"))
     env_cfg, obs_cfg, reward_cfg, motion_cfg, train_cfg = cfg_data
 
-    # Disable reward computation during eval
+    # Disable reward computation and observation noise during eval
     reward_cfg["reward_scales"] = {}
+    obs_cfg["add_noise"] = False
 
     env = G1TrackingEnv(
         num_envs=1,
@@ -80,7 +78,6 @@ def main():
     print(f"  FPS             : {env.motion_lib.fps}")
     print(f"  Frames          : {env.motion_lib.num_frames}")
     print(f"  Bodies          : {env.motion_lib.num_bodies}")
-    print("  --loop          :", args.loop)
     print("=" * 60 + "\n")
 
     obs, _ = env.reset()
@@ -132,13 +129,9 @@ def main():
                     )
 
                 if dones[0]:
-                    if args.loop:
-                        print("\n── Sequence ended, restarting ──\n")
-                        obs, _ = env.reset()
-                        step = 0
-                    else:
-                        print("\nSequence complete.")
-                        break
+                    print("\n── Sequence ended, restarting ──\n")
+                    obs, _ = env.reset()
+                    step = 0
 
     except KeyboardInterrupt:
         print("\nInterrupted.")

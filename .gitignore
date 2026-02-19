@@ -80,17 +80,23 @@ uv.lock
 
 # ── RL / Training ─────────────────────────────────────────────────────────────
 # Training logs and checkpoints (can be large)
-logs/
 runs/
 outputs/
 wandb/
 tensorboard/
 
-# Model checkpoints
+# Model checkpoints (all ignored by default)
 *.pt
 *.pth
 *.ckpt
 *.pkl
+
+# ── Checked-in model checkpoints ──────────────────────────────────────────────
+# Un-ignore specific trained model folders so they can be committed.
+# Add one block per experiment you want to track in git.
+!Genesis/examples/locomotion/logs/g1-tracking-v1/
+!Genesis/examples/locomotion/logs/g1-tracking-v1/*.pt
+!Genesis/examples/locomotion/logs/g1-tracking-v1/*.pkl
 
 # ── Genesis / Simulator ───────────────────────────────────────────────────────
 MUJOCO_LOG.TXT

@@ -35,7 +35,7 @@ except (metadata.PackageNotFoundError, ImportError) as e:
 from rsl_rl.runners import OnPolicyRunner
 import genesis as gs
 
-from tracking.g1_tracking_env import G1TrackingEnv
+from g1_tracking_env import G1TrackingEnv
 
 
 # ── config helpers ────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name",       type=str, default="g1-tracking")
     parser.add_argument("-B", "--num_envs",        type=int, default=4096)
-    parser.add_argument("--max_iterations",        type=int, default=3000)
+    parser.add_argument("--max_iterations",        type=int, default=50000)
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from a checkpoint")
     parser.add_argument("--ckpt",   type=int, default=500,
