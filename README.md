@@ -34,8 +34,9 @@ automatically and loops; tracking RMSE is printed each step.
 
 ```bash
 # from Genesis/examples/locomotion/
-python tracking/g1_tracking_eval.py -e g1-tracking-v1 --ckpt 49999
+python tracking/g1_tracking_eval.py -e g1-tracking-v1 --ckpt 45000
 ```
+Training past 45000 seems to have diminishing returns, but feel free to try other checkpoints in `logs/g1-tracking-v1/`
 
 The viewer opens automatically. Press **ESC** to quit.
 
@@ -43,25 +44,23 @@ The viewer opens automatically. Press **ESC** to quit.
 
 ## Evaluate the walking policy
 
-Requires a trained checkpoint in `logs/<exp_name>/`.
-
 ```bash
 # from Genesis/examples/locomotion/
-python g1_eval.py -e g1-walking --ckpt <iteration>
+python g1_eval.py -e g1-walking-v10 --ckpt 25000
 ```
 
-Replace `<iteration>` with the checkpoint number (e.g. `4999`).
+Replace `25000` with the checkpoint number (e.g. `20000`).
 
 **Keyboard controls in the viewer:**
 
 | Key | Action |
 |-----|--------|
-| `↑` / `W` | Move forward |
-| `↓` / `S` | Move backward |
-| `←` / `A` | Strafe left |
-| `→` / `D` | Strafe right |
-| `Q` / `E` | Rotate left / right |
-| `R` | Reset robot |
+| `↑` | Move forward |
+| `↓` | Move backward |
+| `←` | Strafe left |
+| `→` | Strafe right |
+| `Q` | Rotate left / right |
+| `7` | Reset robot |
 | `ESC` | Quit |
 
 ---
