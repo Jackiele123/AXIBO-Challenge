@@ -1,0 +1,140 @@
+# G1 BeyondMimic Motion-Tracking Configuration
+
+env:
+  num_actions: 12
+  episode_length_s: 15.0          # > motion duration (12.12 s) as safety margin
+  action_scale: 0.25
+  clip_actions: 100.0
+  base_init_pos: [0.0, 0.0, 0.80]
+  base_init_quat: [1.0, 0.0, 0.0, 0.0]
+
+  # Termination (looser than G1Env — allow jump dynamics)
+  termination_if_roll_greater_than: 40   # degrees
+  termination_if_pitch_greater_than: 40  # degrees
+  termination_if_base_height_less_than: 0.20  # metres (allows jump)
+
+  # Default joint angles (rad) — same as G1Env
+  default_joint_angles:
+    left_hip_pitch_joint:  -0.1
+    left_hip_roll_joint:    0.0
+    left_hip_yaw_joint:     0.0
+    left_knee_joint:        0.3
+    left_ankle_pitch_joint: 0.0
+    left_ankle_roll_joint:  0.0
+    right_hip_pitch_joint: -0.1
+    right_hip_roll_joint:   0.0
+    right_hip_yaw_joint:    0.0
+    right_knee_joint:       0.3
+    right_ankle_pitch_joint: 0.0
+    right_ankle_roll_joint:  0.0
+
+  # Joint order (must match motors_dof_idx)
+  joint_names:
+    - left_hip_pitch_joint
+    - left_hip_roll_joint
+    - left_hip_yaw_joint
+    - left_knee_joint
+    - left_ankle_pitch_joint
+    - left_ankle_roll_joint
+    - right_hip_pitch_joint
+    - right_hip_roll_joint
+    - right_hip_yaw_joint
+    - right_knee_joint
+    - right_ankle_pitch_joint
+    - right_ankle_roll_joint
+
+  # Body names for all-body state (must match NPZ body_names order)
+  body_names:
+    - pelvis
+    - left_hip_pitch_link
+    - right_hip_pitch_link
+    - left_hip_roll_link
+    - right_hip_roll_link
+    - left_hip_yaw_link
+    - right_hip_yaw_link
+    - left_knee_link
+    - right_knee_link
+    - left_ankle_pitch_link
+    - right_ankle_pitch_link
+    - left_ankle_roll_link
+    - right_ankle_roll_link
+
+  # PD gains — identical to G1Env
+  stiffness:
+    hip_yaw:   100
+    hip_roll:  100
+    hip_pitch: 100
+    knee:      150
+    ankle:      40
+
+  damping:
+    hip_yaw:   2
+    hip_roll:  2
+    hip_pitch: 2
+    knee:      4
+    ankle:     2
+
+observation:
+  # 6 anchor_ori + 3 lin_vel + 3 ang_vel + 39 body_pos + 78 body_ori + 3 mot_anchor_pos + 6 mot_anchor_ori
+  num_obs: 138
+  obs_scales:
+    lin_vel:    0.2    # world-frame linear velocity  (±5 m/s → ±1.0)
+    ang_vel:    0.1    # world-frame angular velocity  (±10 rad/s → ±1.0)
+    body_pos:   0.5    # body positions in anchor frame (±1.5 m → ±0.75)
+    anchor_pos: 0.2    # motion anchor position in robot frame (±2 m → ±0.4)
+
+motion:
+  file: "tracking/configs/walk_jump_bothfeet_4_small_12dof_80fps.npz"
+
+rewards:
+  # Reward function stds (sigma parameters for exp kernels)
+  anchor_pos_std:      0.5
+  anchor_ori_std:      0.5
+  body_pos_std:        0.15
+  body_ori_std:        0.5
+  body_lin_vel_std:    1.0
+  body_ang_vel_std:    2.0
+  feet_contact_threshold: 0.3   # seconds
+
+  # Scales (multiplied by dt at init)
+  scales:
+    GlobalAnchorPositionTracking:    3.0
+    GlobalAnchorOrientationTracking: 3.0
+    RelativeBodyPositionTracking:   10.0
+    RelativeBodyOrientationTracking: 5.0
+    GlobalBodyLinVelTracking:        2.0
+    GlobalBodyAngVelTracking:        2.0
+    FeetContactTime:                 1.0
+    FallPenalty:                   100.0   # -100 * dt = -2.0 per fall (fires once at fall step)
+    AlivBonus:                       0.5
+    ActionRatePenalty:               0.01
+    DofLimitPenalty:                50.0
+
+training:
+  algorithm:
+    class_name: PPO
+    clip_param: 0.2
+    desired_kl: 0.01
+    entropy_coef: 0.01
+    gamma: 0.99
+    lam: 0.95
+    learning_rate: 0.001
+    max_grad_norm: 1.0
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    schedule: adaptive
+    use_clipped_value_loss: true
+    value_loss_coef: 1.0
+
+  policy:
+    activation: elu
+    actor_hidden_dims: [512, 256, 128]
+    critic_hidden_dims: [512, 256, 128]
+    init_noise_std: 1.0
+    class_name: ActorCritic
+
+  runner:
+    num_steps_per_env: 24
+    save_interval: 100
+    log_interval: 1
+    seed: 1

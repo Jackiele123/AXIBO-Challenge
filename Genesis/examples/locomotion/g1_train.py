@@ -89,14 +89,29 @@ def main():
     parser.add_argument("-e", "--exp_name", type=str, default="g1-walking")
     parser.add_argument("-B", "--num_envs", type=int, default=4096)
     parser.add_argument("--max_iterations", type=int, default=5000)
+    parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint")
+    parser.add_argument("--ckpt", type=int, default=500, help="Checkpoint to resume from")
     args = parser.parse_args()
 
     log_dir = f"logs/{args.exp_name}"
     env_cfg, obs_cfg, reward_cfg, command_cfg, randomization_cfg = get_cfgs()
     train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
 
-    if os.path.exists(log_dir):
-        shutil.rmtree(log_dir)
+    # Handle resume logic
+    if args.resume:
+        resume_path = f"{log_dir}/model_{args.ckpt}.pt"
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+        train_cfg["runner"]["resume"] = True
+        train_cfg["runner"]["resume_path"] = resume_path
+        train_cfg["runner"]["load_run"] = args.exp_name
+        train_cfg["runner"]["checkpoint"] = args.ckpt
+        print(f"Resuming training from {resume_path}")
+    else:
+        # Only clear log directory if not resuming
+        if os.path.exists(log_dir):
+            shutil.rmtree(log_dir)
+    
     os.makedirs(log_dir, exist_ok=True)
 
     pickle.dump(
@@ -116,6 +131,12 @@ def main():
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    
+    # Load checkpoint if resuming
+    if args.resume:
+        print(f"Loading model checkpoint: {train_cfg['runner']['resume_path']}")
+        runner.load(train_cfg["runner"]["resume_path"])
+        print(f"Resuming from iteration {args.ckpt}")
 
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 

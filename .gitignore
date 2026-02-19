@@ -1,0 +1,114 @@
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyd
+*.so
+*.o
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+MANIFEST
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+.installed.cfg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+__pypackages__/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# Testing
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+__snapshots__/
+.claude/
+
+# Jupyter
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# Misc Python tooling
+.python-version
+.ropeproject
+.spyderproject
+.spyproject
+uv.lock
+
+# ── RL / Training ─────────────────────────────────────────────────────────────
+# Training logs and checkpoints (can be large)
+logs/
+runs/
+outputs/
+wandb/
+tensorboard/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# ── Genesis / Simulator ───────────────────────────────────────────────────────
+MUJOCO_LOG.TXT
+imgui.ini
+.polyscope.ini
+genesis/assets/terrain/
+tmp/
+
+# ── Media ─────────────────────────────────────────────────────────────────────
+*.mp4
+*.avi
+*.gif
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.log
+sftp-config.json
+/site

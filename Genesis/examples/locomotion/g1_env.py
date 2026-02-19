@@ -180,6 +180,18 @@ class G1Env:
         self.last_contacts = torch.zeros((self.num_envs, 2), dtype=gs.tc_bool, device=gs.device)
         self.feet_first_contact = torch.zeros((self.num_envs, 2), dtype=gs.tc_bool, device=gs.device)
         self.latched_air_time = torch.zeros((self.num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        
+        # Foot phase tracking (0 to 1, continuous)
+        self.foot_phases = torch.zeros((self.num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        # 0 = left, 1 = right
+        # Phase description: 0->0.5 = stance, 0.5->1.0 = swing
+        # Phase offset: left and right should be 0.5 apart for walking gait
+        self.gait_period = 1.0  # seconds for a full gait cycle (adjustable based on speed)
+        
+        # Desired ankle angles for heel-strike motion (pitch)
+        self.desired_ankle_angles = torch.zeros((self.num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        self.desired_knee_angles = torch.zeros((self.num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        self.ankle_joint_indices = [4, 10]  # left_ankle_pitch_joint, right_ankle_pitch_joint
 
         # Domain randomization - observation noise
         self.add_noise = self.randomization_cfg.get("add_noise", True)
@@ -229,6 +241,9 @@ class G1Env:
 
     def _resample_commands(self, envs_idx):
         commands = gs_rand(*self.commands_limits, (self.num_envs,))
+        # set all commands zero, randomly 10% of the time, to encourage standing and better foot tracking rewards
+        zero_mask = torch.rand((self.num_envs,), device=gs.device) < 0.1
+        commands[zero_mask] = 0.0
         if envs_idx is None:
             self.commands.copy_(commands)
         else:
@@ -305,6 +320,13 @@ class G1Env:
             
             # 7. Update Last Contact for next step
             self.last_contacts[:, i] = in_contact
+        
+        # Update foot phases
+        self._update_foot_phases()
+        
+        # Compute desired ankle angles for heel-strike motion
+        self._compute_desired_ankle_angles()
+        self._compute_desired_knee_angles()
 
         # compute reward
         self.rew_buf.zero_()
@@ -391,7 +413,21 @@ class G1Env:
             self.last_dof_vel.masked_fill_(envs_idx[:, None], 0.0)
             self.episode_length_buf.masked_fill_(envs_idx, 0)
             self.reset_buf.masked_fill_(envs_idx, True)
-
+            
+        # Reset phase tracking
+        if envs_idx is None:
+            # Start in flat-foot phase (0.1) so desired ankle = 0 rad, matching default_dof_pos.
+            # Phase 0.0 = heel-strike (desired +0.15 rad) would cause an immediate penalty spike.
+            # Right foot offset by 0.5 for walking gait antiphase: 0.1 + 0.5 = 0.6
+            self.foot_phases[:, 0] = 0.1
+            self.foot_phases[:, 1] = 0.6
+            self.desired_ankle_angles.zero_()
+            self.desired_knee_angles.zero_()
+        else:
+            self.foot_phases[envs_idx, 0] = 0.1
+            self.foot_phases[envs_idx, 1] = 0.6
+            self.desired_ankle_angles.masked_fill_(envs_idx[:, None], 0.0)
+            self.desired_knee_angles.masked_fill_(envs_idx[:, None], 0.0)
         # fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
         self.extras["episode"] = {}
@@ -454,6 +490,109 @@ class G1Env:
             # This is a placeholder for when the API supports it
             pass
 
+    def _update_foot_phases(self):
+        """Update foot phase based on contacts and command velocity."""
+        # Calculate command speed
+        cmd_mag = torch.norm(self.commands[:, :2], dim=1)
+        
+        # Adaptive gait period: faster when speed is higher
+        # At 0 m/s: 1.5s period (slow)
+        # At 1.5 m/s: 1s period (fast)
+        speed_ratio = torch.clamp(cmd_mag / 1.5, 0.0, 1.0)
+        adaptive_period = 1.5 - (speed_ratio * 0.50)
+        
+        # Phase increment per timestep
+        phase_increment = self.dt / adaptive_period
+        
+        # Only update phase if we're commanding movement
+        is_moving = cmd_mag > 0.1
+        
+        # Increment phase
+        self.foot_phases += phase_increment.unsqueeze(1) * is_moving.unsqueeze(1)
+        
+        # Wrap phase to [0, 1)
+        self.foot_phases = torch.fmod(self.foot_phases, 1.0)
+        
+        # On first contact (landing), snap each foot's phase to 0.0 (start of stance).
+        # Both feet use the same target and circular distance to handle the 1.0->0.0 wrap.
+        #
+        # Why 0.0 for both feet?
+        # Each foot's phase independently tracks its own gait cycle. Both feet contact
+        # near their own phase 0.0 (after wrapping from ~1.0). The 0.5 antiphase offset
+        # is maintained through initialization and natural phase advancement — it does
+        # NOT need a different snap target per foot.
+        #
+        # The previous right_target_phase=0.5 caused a critical bug: on the first step
+        # of every episode, both feet are in contact and first_contact fires for both.
+        # Right foot at phase 0.6 had circular distance 0.1 from 0.5 (<0.3 threshold),
+        # so it immediately snapped to 0.5 (swing zone >=0.4). This made every
+        # phase-dependent reward treat the right foot as "should be swinging" even
+        # during stance, causing persistent right-leg stiffness.
+        snap_target = torch.tensor(0.0, device=gs.device, dtype=gs.tc_float)
+        for i in range(2):
+            phase_dist = torch.minimum(
+                torch.abs(self.foot_phases[:, i] - snap_target),
+                1.0 - torch.abs(self.foot_phases[:, i] - snap_target)
+            )
+            near_target = phase_dist < 0.3
+            should_snap = self.feet_first_contact[:, i] & near_target & is_moving
+            self.foot_phases[:, i] = torch.where(should_snap, snap_target, self.foot_phases[:, i])
+    
+    def _compute_desired_ankle_angles(self):
+        """Compute desired ankle angles for heel-strike to toe-off motion.
+
+        Biomechanically corrected (2026-02-18):
+          heel_angle=+0.08 rad (+4.6 deg dorsiflexion at heel strike, human: 0-5 deg)
+          pushoff_angle=-0.28 rad (-16 deg plantarflexion at toe-off, human: 15-20 deg)
+          swing_angle=+0.07 rad (+4 deg dorsiflexion for foot clearance; was -0.15 — sign fixed)
+          land_angle=+0.05 rad (+2.9 deg dorsiflexion held from phase 0.65 onward)
+        Smooth ramps replace instantaneous steps at phase boundaries.
+        """
+        heel_angle    =  0.08   # dorsiflexion at heel strike
+        pushoff_angle = -0.28   # plantarflexion at push-off
+        swing_angle   =  0.07   # dorsiflexion during swing for foot clearance
+        land_angle    =  0.05   # dorsiflexion for pre-landing
+
+        for i in range(2):  # left, right
+            phase = self.foot_phases[:, i]
+
+            # Heel strike (0.00-0.05): brief dorsiflexion
+            hs_mask = phase < 0.05
+
+            # Heel-to-flat ramp (0.05-0.08): 3% smooth transition to neutral
+            hs_flat_mask = (phase >= 0.05) & (phase < 0.08)
+            hs_flat_angle = heel_angle * (1.0 - (phase - 0.05) / 0.03)
+
+            # Flat foot (0.08-0.33): neutral stance
+            flat_mask = (phase >= 0.08) & (phase < 0.33)
+
+            # Push-off ramp (0.33-0.40): 7% ramp to full plantarflexion
+            pushoff_mask = (phase >= 0.33) & (phase < 0.40)
+            pushoff_ramp = pushoff_angle * ((phase - 0.33) / 0.07)
+
+            # Early swing recovery (0.40-0.55): ramp plantarflexion -> dorsiflexion
+            early_swing_mask = (phase >= 0.40) & (phase < 0.55)
+            early_prog = (phase - 0.40) / 0.15
+            early_swing_angle = pushoff_angle + early_prog * (swing_angle - pushoff_angle)
+
+            # Mid-swing clearance (0.55-0.65): hold dorsiflexion for foot clearance
+            mid_swing_mask = (phase >= 0.55) & (phase < 0.65)
+
+            # Pre-landing (0.65-1.00): maintain dorsiflexion for heel-strike prep
+            landing_mask = phase >= 0.65
+
+            # Combine all phases
+            desired_angle = torch.zeros_like(phase)
+            desired_angle = torch.where(hs_mask, heel_angle, desired_angle)
+            desired_angle = torch.where(hs_flat_mask, hs_flat_angle, desired_angle)
+            desired_angle = torch.where(flat_mask, 0.0, desired_angle)
+            desired_angle = torch.where(pushoff_mask, pushoff_ramp, desired_angle)
+            desired_angle = torch.where(early_swing_mask, early_swing_angle, desired_angle)
+            desired_angle = torch.where(mid_swing_mask, swing_angle, desired_angle)
+            desired_angle = torch.where(landing_mask, land_angle, desired_angle)
+
+            self.desired_ankle_angles[:, i] = desired_angle
+        
     def _push_robots(self):
         """Apply random external forces to robot base periodically."""
         push_interval = int(self.push_interval_s / self.dt)
@@ -526,13 +665,47 @@ class G1Env:
     
     def _reward_FeetAirTimePenalty(self):
         """Penalize feet air time deviation from target (only applied at moment of contact)"""
-        target_air_time = self.reward_cfg.get("target_feet_air_time", 0.4)
+        target_air_time = self.reward_cfg.get("target_feet_air_time", 0.6)
         
         # Compute penalty: absolute deviation from target, masked by first contact
         pen_air_time = torch.sum(
             torch.abs(self.latched_air_time - target_air_time) * self.feet_first_contact.float(), dim=1
         )
         return -pen_air_time
+    # def _reward_FeetAirTimePenalty(self):
+    #     """
+    #     Adaptive Air Time Penalty (Inverse scaling).
+    #     1. Only applies when moving (cmd > 0.1).
+    #     2. Target scales INVERSELY with speed: 
+    #        - 0.6s at 0.0 m/s (Slow swings)
+    #        - 0.2s at 1.5 m/s (Fast, rapid stepping)
+    #     """
+    #     # Calculate command speed (XY magnitude)
+    #     cmd_mag = torch.norm(self.commands[:, :2], dim=1)
+        
+    #     # 1. Mask: Only penalize if we WANT to walk (cmd > 0.1 m/s)
+    #     is_moving_cmd = cmd_mag > 0.1
+        
+    #     # 2. Adaptive Target Calculation
+    #     # Clamp speed to 1.5 max
+    #     speed_ratio = torch.clamp(cmd_mag / 1.5, 0.0, 1.0)
+        
+    #     # Inverse Interpolation: Start at 0.8, subtract up to 0.6 to reach 0.2
+    #     # Ratio 0.0 -> 1.0 - 0.0 = 1.0s
+    #     # Ratio 1.0 -> 1.0 - 0.8 = 0.2s
+    #     adaptive_target = 0.6 - (speed_ratio * 0.4)
+        
+    #     # Expand target to shape [num_envs, 2]
+    #     target_air_time = adaptive_target.unsqueeze(1).repeat(1, 2)
+        
+    #     # 3. Calculate Reward
+    #     air_time_error = torch.abs(self.latched_air_time - target_air_time)
+        
+    #     # Mask by first_contact AND is_moving_cmd
+    #     valid_mask = self.feet_first_contact & is_moving_cmd.unsqueeze(1)
+        
+    #     pen_air_time = torch.sum(air_time_error * valid_mask.float(), dim=1)
+    #     return -pen_air_time
     
     def _reward_G1FeetSlidePenalty(self):
         """Penalize feet sliding when in contact"""
@@ -585,3 +758,165 @@ class G1Env:
     #     force_limit = self.reward_cfg.get("contact_force_limit", 1.0)
     #     above_limit = torch.clamp(self.foot_contact_weighted - force_limit, min=0.0)
     #     return torch.sum(torch.square(above_limit), dim=1)
+    
+    def _reward_FootPhaseReward(self):
+        cmd_mag = torch.norm(self.commands[:, :2], dim=1)
+        is_moving = cmd_mag > 0.1
+        
+        # Calculate stance phase threshold based on speed (60% stance, 40% swing)
+        stance_threshold = 0.4
+        
+        # Determine expected contact state
+        left_should_contact = self.foot_phases[:, 0] < stance_threshold
+        right_should_contact = self.foot_phases[:, 1] < stance_threshold
+        
+        # Get actual contact state
+        left_in_contact = self.last_contacts[:, 0]
+        right_in_contact = self.last_contacts[:, 1]
+        
+        # Reward: match expected contact state
+        left_correct = (left_should_contact == left_in_contact).float()
+        right_correct = (right_should_contact == right_in_contact).float()
+        
+        # IMPORTANT: Penalize having both feet on ground when at least one should be in swing
+        both_should_not_contact = ~left_should_contact | ~right_should_contact  # At least one in swing
+        both_actually_contact = left_in_contact & right_in_contact  # Both on ground
+        double_stance_penalty = (both_should_not_contact & both_actually_contact).float()
+        
+        # Combined reward: high when contacts match phase AND no double stance during swing
+        phase_alignment = (left_correct + right_correct) / 2.0 - double_stance_penalty
+        
+        # Only apply when moving
+        return phase_alignment * is_moving
+    
+    def _reward_StandingKneeReward(self):
+        """Reward straight knees when standing still (zero command)."""
+        cmd_mag = torch.norm(self.commands[:, :2], dim=1)
+        is_standing = cmd_mag < 0.1  # Standing still threshold
+        
+        # Knee joint indices: left_knee_joint (3), right_knee_joint (9)
+        knee_angles = self.dof_pos[:, [3, 9]]
+        
+        # Desired knee angle when standing: match default_dof_pos (0.3 rad)
+        # Avoids fighting the PD controller which targets default pose
+        desired_standing_angle = 0.3
+        knee_error = torch.sum(torch.square(knee_angles - desired_standing_angle), dim=1)
+        
+        # Exponential reward: high when knees are straight
+        knee_reward = torch.exp(-knee_error / 0.1)
+        
+        # Only apply when standing
+        return knee_reward * is_standing
+    
+    def _reward_AnkleTrackingPenalty(self):
+        """Penalize deviation from desired ankle angles for natural heel-strike motion."""
+        cmd_mag = torch.norm(self.commands[:, :2], dim=1)
+        is_moving = cmd_mag > 0.1
+        
+        # Get current ankle angles (pitch)
+        ankle_angles = self.dof_pos[:, self.ankle_joint_indices]
+
+        # Compute per-ankle squared error (shape: num_envs x 2)
+        per_ankle_error = torch.square(ankle_angles - self.desired_ankle_angles)
+
+        # Apply exp kernel per-ankle then sum:
+        # error = 0 (perfect) -> exp(0) - 1 = 0 per ankle
+        # error = large       -> exp(-large) - 1 -> -1 per ankle (max -2 total)
+        # sigma = 0.1 rad^2 (~0.32 rad) gives a wider gradient region than 0.05
+        per_ankle_penalty = torch.exp(-per_ankle_error / 0.1) - 1.0
+        penalty = torch.sum(per_ankle_penalty, dim=1)
+
+        # Only penalize when moving
+        return penalty * is_moving
+    
+    def _reward_StandStillVelocityPenalty(self):
+        """Penalize any joint or base movement when commanded to stand still."""
+        cmd_mag = torch.norm(self.commands[:, :2], dim=1)
+        is_standing = cmd_mag < 0.1  # Standing still threshold
+        
+        # Penalize joint velocities
+        joint_vel_penalty = torch.sum(torch.square(self.dof_vel), dim=1)
+        
+        # Penalize base linear velocity (XY plane mainly, but include Z)
+        base_lin_vel_penalty = torch.sum(torch.square(self.base_lin_vel), dim=1)
+        
+        # Penalize base angular velocity
+        base_ang_vel_penalty = torch.sum(torch.square(self.base_ang_vel), dim=1)
+        
+        # Total penalty
+        total_penalty = joint_vel_penalty + base_lin_vel_penalty + base_ang_vel_penalty
+        
+        # Only apply when standing
+        return -total_penalty * is_standing
+    
+    def _reward_StandStillContactReward(self):
+        """Reward having both feet on the ground when commanded to stand still."""
+        cmd_mag = torch.norm(self.commands[:, :2], dim=1)
+        is_standing = cmd_mag < 0.1  # Standing still threshold
+        
+        # Check if both feet are in contact
+        both_feet_contact = (self.last_contacts[:, 0] & self.last_contacts[:, 1]).float()
+        
+        # Only reward when standing
+        return both_feet_contact * is_standing
+
+    def _compute_desired_knee_angles(self):
+        """
+        Compute desired knee flexion based on human gait biomechanics.
+        G1 Knee Joint (Revolute): 0.0 = Straight, +Pos = Bent.
+
+        Human Gait Cycle Approximation:
+        - Phase 0.0-0.4 (Stance): sin bump, peak ~0.35 rad (20 deg) at phase 0.20
+        - Phase 0.4-0.7 (Swing Flexion): sin-based rise to ~1.1 rad (63 deg) at phase 0.70
+        - Phase 0.7-1.0 (Swing Extension): power-law drop (1-t)^1.5, faster than flexion
+          -> phase 0.85: ~0.45 rad (26 deg) vs 0.81 rad (46 deg) with symmetric sin
+
+        Boundary aligned with FootPhaseReward and _compute_desired_ankle_angles: 0.4
+        Asymmetric swing: sin flexion + (1-t)^1.5 extension for faster knee drop.
+        """
+        self.desired_knee_angles.zero_()
+
+        for i in range(2):  # Left and Right
+            phase = self.foot_phases[:, i]
+
+            # 1. Stance Phase (0.0 to 0.4): slight bend then extend for support
+            stance_mask = phase < 0.4
+            stance_progress = (phase / 0.4) * math.pi
+            stance_angle = 0.1 + 0.25 * torch.sin(stance_progress)
+
+            # 2. Swing Flexion (0.4 to 0.7): rapid knee lift via sin(0 -> pi/2)
+            swing_flex_mask = (phase >= 0.4) & (phase < 0.7)
+            flex_progress = (phase - 0.4) / 0.3  # 0 to 1
+            flex_angle = 0.1 + 1.0 * torch.sin(flex_progress * math.pi / 2)
+            # phase 0.40: 0.10 rad; phase 0.70: 1.10 rad
+
+            # 3. Swing Extension (0.7 to 1.0): faster power-law drop
+            ext_progress = (phase - 0.7) / 0.3  # 0 to 1
+            ext_angle = 0.1 + 1.0 * (1.0 - ext_progress) ** 1.5
+            # phase 0.70: 1.10 rad; phase 0.85: ~0.45 rad; phase 1.0: 0.10 rad
+
+            # Combine: stance | swing_flex | swing_ext
+            self.desired_knee_angles[:, i] = torch.where(
+                stance_mask, stance_angle,
+                torch.where(swing_flex_mask, flex_angle, ext_angle)
+            )
+    def _reward_KneeRegularizationReward(self):
+            """
+            Reward tracking natural human-like knee flexion profile.
+            Only applies when moving.
+            """
+            cmd_mag = torch.norm(self.commands[:, :2], dim=1)
+            is_moving = cmd_mag > 0.1
+            
+            # Knee indices: 3 (Left), 9 (Right)
+            current_knees = self.dof_pos[:, [3, 9]]
+            
+            # Calculate error (squared difference)
+            error = torch.square(current_knees - self.desired_knee_angles)
+            
+            # Convert to reward (Gaussian kernel)
+            # Sigma = 0.2 (tolerant, we want the "shape" not perfect tracking)
+            reward = torch.exp(-error / 0.2)
+            
+            # Sum both knees and mask
+            return torch.sum(reward, dim=1) * is_moving.float()

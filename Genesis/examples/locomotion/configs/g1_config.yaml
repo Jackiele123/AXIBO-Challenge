@@ -23,13 +23,13 @@ env:
     left_hip_roll_joint: 0.0
     left_hip_yaw_joint: 0.0
     left_knee_joint: 0.3
-    left_ankle_pitch_joint: -0.2
+    left_ankle_pitch_joint: 0
     left_ankle_roll_joint: 0.0
     right_hip_pitch_joint: -0.1
     right_hip_roll_joint: 0.0
     right_hip_yaw_joint: 0.0
     right_knee_joint: 0.3
-    right_ankle_pitch_joint: -0.2
+    right_ankle_pitch_joint: 0
     right_ankle_roll_joint: 0.0
   
   # Joint names (order matters for action indexing)
@@ -72,9 +72,10 @@ observation:
 
 commands:
   num_commands: 3
+  zero_command_prob: 0.1
   lin_vel_x_range: [-1.0, 1.5]
-  lin_vel_y_range: [-0.5, 0.5]
-  ang_vel_range: [-0.5, 0.5]
+  lin_vel_y_range: [0, 0]
+  ang_vel_range: [0, 0]
 
 # Reward configuration
 rewards:
@@ -85,22 +86,28 @@ rewards:
     LinVelZPenalty: 20.0
     AngVelXYPenalty: 0.5
     OrientationPenalty: 100.0
-    ActionRatePenalty: 0.1
+    ActionRatePenalty: 0.01
     ActionLimitPenalty: 0.1
     HipYawPenalty: 5.0
     HipRollPenalty: 5.0
     BodyRollPenalty: 100.0
-    FeetAirTimePenalty: 100.0
+    FeetAirTimePenalty: 100.0 # 100
     G1FeetSlidePenalty: 2.0
-    FeetOrientationPenalty: 30.0
+    FeetOrientationPenalty: 0.0
     DofPosLimitPenalty: 100.0
+    FootPhaseReward: 6.0
+    StandingKneeReward: 2.0
+    AnkleTrackingPenalty: 6.0
+    StandStillVelocityPenalty: 0.05
+    StandStillContactReward: 0.5
+    KneeRegularizationReward: 5.0
   # Reward parameters
   parameters:
     tracking_sigma: 0.25
     base_height_target: 0.75
-    target_feet_air_time: 0.4
+    target_feet_air_time: 0.6
     feet_height_target: 0.2
-    action_limit: 1.0
+    action_limit: 2.0
     contact_force_limit: 1.0  # normalized
 
 # Domain randomization
